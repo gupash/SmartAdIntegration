@@ -16,6 +16,6 @@ libraryDependencies ++= Seq(
   "com.typesafe.akka" %% "akka-http" % AkkaHttpVersion,
   "com.typesafe.akka" %% "akka-http-spray-json" % AkkaHttpVersion,
   "com.typesafe.akka" %% "akka-http-xml" % AkkaHttpVersion,
-  "com.lightbend.akka" %% "akka-stream-alpakka-file" % "3.0.1",
-  "ch.qos.logback" % "logback-classic" % "1.2.3"
+  "ch.qos.logback" % "logback-classic" % "1.2.3",
+  "com.amazonaws" % "aws-java-sdk-s3" % "1.11.710"
 )

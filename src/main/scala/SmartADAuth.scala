@@ -1,16 +1,16 @@
 package com.imvu.smartad
 
 import S3Ops.{downloadObject, listS3ObjectsRecursively}
+import SmartAdModels._
 
-import akka.Done
-import akka.actor.{ActorRef, ActorSystem, Props}
+import akka.actor.{ActorRef, ActorSystem, Props, Terminated}
 import akka.http.scaladsl.model.{headers, _}
 import akka.http.scaladsl.{ConnectionContext, Http, HttpsConnectionContext}
 import akka.pattern.ask
+import akka.stream.Materializer
 import akka.stream.scaladsl.Source
 import akka.util.Timeout
-import SmartAdModels.{GetToken, Profile, Profiles, Token, UpdateBearerToken}
-
+import org.slf4j.{Logger, LoggerFactory}
 import spray.json.DefaultJsonProtocol._
 import spray.json.{RootJsonFormat, enrichAny}
 
@@ -21,6 +21,8 @@ import scala.concurrent.{ExecutionContextExecutor, Future}
 import scala.util.{Failure, Success}
 
 object SmartADAuth {
+
+  val log: Logger = LoggerFactory.getLogger(SmartADAuth.getClass)
 
   val localS3FilePath: String = "/Users/agupta/IdeaProjects/SmartAdIntegration/s3files/"
   val dmpUrl: String = "https://dmp.smartadserverapis.com/segmentproviders"
@@ -33,7 +35,8 @@ object SmartADAuth {
   implicit val profile: RootJsonFormat[Profile] = jsonFormat2(Profile)
   implicit val profiles: RootJsonFormat[Profiles] = jsonFormat1(Profiles)
   implicit val system: ActorSystem = ActorSystem("SmartAd")
-  implicit val executionContext: ExecutionContextExecutor = system.dispatcher
+  implicit val mat: Materializer = Materializer(system)
+  implicit val executionContext: ExecutionContextExecutor = mat.executionContext
 
   val sslCtx: HttpsConnectionContext = ConnectionContext.httpsClient(SSLContext.getDefault)
   Http().setDefaultClientHttpsContext(sslCtx)
@@ -44,19 +47,19 @@ object SmartADAuth {
 
     val smartADActor: ActorRef = system.actorOf(Props[SmartAdAuthActor], "smart-ad-auth-actor")
 
-    println("Started Application")
+    log.info("Started Application")
 
     val clientId = args(0)
     val clientSecret = args(1)
 
-    // Downloading segment files from s3
-    downloadSegmentData()
+    //Downloading segment files from s3
+    //downloadSegmentData()
 
-    println("Old files cleared from s3 files download dir")
+    log.info("Old files cleared from s3 files download dir")
 
     val txtFiles: Iterator[File] = localS3FilesDir.listFiles.filter(_.getName.endsWith(".txt")).iterator
 
-    val data = txtFiles.map(scala.io.Source.fromFile).flatMap(_.getLines())
+    val data: Iterator[String] = txtFiles.map(scala.io.Source.fromFile).flatMap(_.getLines())
 
     val dataGroup: data.GroupedIterator[String] = data.grouped(1000)
 
@@ -80,26 +83,36 @@ object SmartADAuth {
 
     def bearer: Future[String] = (smartADActor ? GetToken).mapTo[Token].map(_.token)
 
-    println("Starting Upload (it make take around 15-20 minutes) ...")
+    log.info("Starting Upload (it may take around 15-20 minutes) ...")
 
-    val processStatus: Future[Done] = Source
+    val processStatus: Future[Int] = Source
       .fromIterator(() => segmentJson)
-      .throttle(1, 1.second)
-      .mapAsync(parallelism = 1)(segment => updateSegmentForProfile(segment, bearer))
-      .run()
+      .throttle(1, 1.seconds)
+      .mapAsyncUnordered(parallelism = 4)(segment => updateSegmentForProfile(segment, bearer))
+      .map(_ => 1)
+      .runFold(0)(_ + _)
 
-    processStatus.onComplete {
-      case Success(_) =>
-        println("Upload finished successfully!!")
+    def shutDownHook: Future[Terminated] =
+      Http().shutdownAllConnectionPools().flatMap { _ =>
+        mat.shutdown()
         system.terminate()
-      case Failure(exception) =>
-        println(exception.getMessage)
-        system.terminate()
+      }
+
+    timedFuture(processStatus)
+
+    processStatus.onComplete { res =>
+      res match {
+        case Success(count) =>
+          log.info(s"Processed $count rows (each row contains 1000 profiles except may be the last one)")
+          log.info("Upload finished successfully!!")
+        case Failure(exception) =>
+          log.error(exception.getMessage)
+      }
+      shutDownHook
     }
   }
 
   private def updateSegmentForProfile(segmentJson: String, bearer: Future[String]): Future[HttpResponse] = {
-
     // This step is needed as the json being passed to smartAD
     // is not a well formed json and smarts with `[` and ends on `]`
     val truncatedJson = segmentJson.drop(12).dropRight(1)
@@ -128,8 +141,14 @@ object SmartADAuth {
     try {
       localS3FilesDir.listFiles().map(_.delete())
     } catch {
-      case ex: Exception => println(s"Couldn't clear the s3 files download dir\n${ex.getMessage}")
+      case ex: Exception => log.error(s"Couldn't clear the s3 files download dir\n${ex.getMessage}")
     }
     downloadObject(listS3ObjectsRecursively(S3Ops.listObjects(s3SegmentDataBucket, s3SegmentDataPrefix)))
+  }
+
+  def timedFuture[T](future: Future[T]): Future[T] = {
+    val start = System.currentTimeMillis()
+    future.onComplete(_ => log.info(s"Future took ${System.currentTimeMillis() - start} ms"))
+    future
   }
 }
